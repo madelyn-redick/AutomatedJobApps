@@ -27,6 +27,10 @@ MAX_DAYS_OLD = int(os.getenv("MAX_DAYS_OLD", "3"))
 RESULTS_PER_PAGE = int(os.getenv("ADZUNA_RESULTS_PER_PAGE", "20"))
 MAX_PAGES = int(os.getenv("ADZUNA_MAX_PAGES", "2"))
 
+GREENHOUSE_COMPANIES = [
+    c.strip() for c in os.getenv("GREENHOUSE_COMPANIES", "").split(",") if c.strip()
+]
+
 RESUME_FILE = os.getenv("RESUME_FILE", "resume_and_cover_letter.txt")
 MATCH_THRESHOLD = float(os.getenv("MATCH_THRESHOLD", "0.15"))
 PRIORITY_KEYWORDS = [k.strip().lower() for k in os.getenv("PRIORITY_KEYWORDS", "").split(",") if k.strip()]
@@ -57,7 +61,11 @@ def init_db():
             scraped_date TEXT,
             score REAL,
             is_priority INTEGER,
-            status TEXT DEFAULT 'new'
+            status TEXT DEFAULT 'new',
+            keyword_score REAL,
+            semantic_score REAL,
+            penalty_score REAL,
+            final_score REAL
         )
         """
     )
@@ -78,7 +86,7 @@ def get_adzuna_jobs():
     Returns:
         jobs (list[dict]): list of job postings, each dictionary contains job title, company, location, description, application URL, source, and posted date
     """
-
+    print("Scanning Adzuna:")
     jobs = []
 
     # loop through each page of API results until page limit reached or no more jobs
@@ -124,20 +132,61 @@ def get_adzuna_jobs():
     return jobs
 
 
+def get_greenhouse_jobs():
+    """ retrieves job listings that match search criteria from public Greenhouse Jobs API
+
+        Returns:
+            jobs (list[dict]): list of job postings, each dictionary contains job title, company, location, description, application URL, source, and posted date
+    """
+    print("Scanning Greenhouse:")
+    jobs = []
+
+    # loop through each company configured to use Greenhouse
+    for company in GREENHOUSE_COMPANIES:
+        url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
+
+        # send request to company's Greenhouse job board
+        try:
+            resp = requests.get(url, params={"content": "true"}, timeout=15)
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.RequestException as e:
+            # skip company if request fails, continue
+            print(f"  [error] Greenhouse '{company}': {e}")
+            continue
+
+        # format
+        for r in data.get("jobs", []):
+            jobs.append(
+                {
+                    "title": r.get("title", "").strip(),
+                    "company": company,
+                    "location": (r.get("location") or {}).get("name", ""),
+                    "description": r.get("content", ""),
+                    "url": r.get("absolute_url", ""),
+                    "source": "greenhouse",
+                    "posted_date": (r.get("updated_at") or "")[:10],
+                }
+            )
+
+    print(f"Greenhouse: fetched {len(jobs)} postings across "f"{len(GREENHOUSE_COMPANIES)} companies")
+
+    return jobs
+
+
 def load_resume_text():
     with open(RESUME_FILE, "r", encoding="utf-8") as f:
         return f.read()
 
 def score_jobs(jobs, resume_text):
-    """
-    Score each job posting based on its similarity to resume using TF-IDF vectorization and cosine similarity. each job is assigned a similarity score, jobs containing any configured priority keywords are flagged
+    """ score each job posting based on its similarity to resume using TF-IDF vectorization and cosine similarity. each job is assigned a similarity score, jobs containing any configured priority keywords are flagged
 
     Args:
         jobs (list[dict]): list of job postings to score
         resume_text (str): text extracted from resume
 
     Returns:
-        list[dict]: original list of jobs with two additional fields:
+        jobs (list[dict]): original list of jobs with two additional fields:
             - score (float): similarity score between resume and job
             - is_priority (bool): True if a priority keyword is found in job title or description
     """
@@ -225,6 +274,7 @@ def main():
     print("Searching for matching job postings")
     all_jobs = []
     all_jobs += get_adzuna_jobs()
+    all_jobs += get_greenhouse_jobs()
 
     print("Scoring against resume/cover letter...")
     resume_text = load_resume_text()
@@ -246,3 +296,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # TODO ADD GREENHOUSE JOBS and improve matching and ranking
