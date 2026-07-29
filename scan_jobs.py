@@ -10,7 +10,7 @@ import hashlib
 import requests
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
-from datetime import datetime
+from datetime import datetime, timedelta
 import pandas as pd
 from bs4 import BeautifulSoup
 import html
@@ -28,6 +28,7 @@ SEARCH_LOCATION = os.getenv("SEARCH_LOCATION", "")
 MAX_DAYS_OLD = int(os.getenv("MAX_DAYS_OLD", "3"))
 RESULTS_PER_PAGE = int(os.getenv("ADZUNA_RESULTS_PER_PAGE", "20"))
 MAX_PAGES = int(os.getenv("ADZUNA_MAX_PAGES", "2"))
+GREENHOUSE_MAX_DAYS_OLD = 14
 
 GREENHOUSE_COMPANIES = [
     c.strip() for c in os.getenv("GREENHOUSE_COMPANIES", "").split(",") if c.strip()
@@ -204,15 +205,37 @@ def get_greenhouse_jobs():
 
         # format
         for r in data.get("jobs", []):
+
+            job_url = r.get("absolute_url", "")
+
+            # only keep Greenhouse URLs
+            if "greenhouse" not in job_url.lower():
+                continue
+
+            posted_date = (r.get("updated_at") or "")[:10]
+
+            # skip jobs without a valid date
+            if not posted_date:
+                continue
+
+            try:
+                posted_datetime = datetime.strptime(posted_date, "%Y-%m-%d")
+            except ValueError:
+                continue
+
+            # only keep jobs posted within the last 14 days
+            if datetime.now() - posted_datetime > timedelta(days=GREENHOUSE_MAX_DAYS_OLD):
+                continue
+
             jobs.append(
                 {
                     "title": r.get("title", "").strip(),
                     "company": company,
                     "location": (r.get("location") or {}).get("name", ""),
                     "description": clean_html_text(r.get("content", "")),
-                    "url": r.get("absolute_url", ""),
+                    "url": job_url,
                     "source": "greenhouse",
-                    "posted_date": (r.get("updated_at") or "")[:10],
+                    "posted_date": posted_date,
                 }
             )
 
