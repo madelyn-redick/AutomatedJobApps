@@ -2,3 +2,4 @@ requests
 scikit-learn
 python-dotenv
 pandas
+bs4
