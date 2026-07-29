@@ -3,6 +3,7 @@
 # July 2026
 
 import os
+from click import launch
 from dotenv import load_dotenv
 import csv
 import sqlite3
@@ -14,6 +15,8 @@ from datetime import datetime, timedelta
 import pandas as pd
 from bs4 import BeautifulSoup
 import html
+from dash import Dash, html, dcc, Input, Output, State, no_update, clientside_callback
+import dash_ag_grid as dag
 
 load_dotenv()
 
@@ -41,6 +44,7 @@ EXCLUDE_KEYWORDS = [k.strip().lower() for k in os.getenv("EXCLUDE_KEYWORDS", "")
 
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", "matched_jobs.csv")
 DB_FILE = os.getenv("DB_FILE", "jobs.db")
+APPLIED_CSV = os.getenv("APPLIED_CSV", "applied_jobs.csv")
 
 def parse_weight_dict(value):
     """ convert comma-separated environment variable string into a dictionary. example: "python:5,sql:3" becomes: {"python": 5, "sql": 3}
@@ -446,9 +450,9 @@ def write_matches_csv(matches):
         print("No new matches above threshold")
         return
     headers = ["title", "company", "location", "score", "semantic_score", "keyword_score","penalty_score", "is_priority", "source", "url", "posted_date", "description"]
-    with open('matched_jobs.csv', 'w', newline='', encoding='utf-8') as file:
+    """with open('matched_jobs.csv', 'w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
-        writer.writerow(headers)
+        writer.writerow(headers)"""
 
     df = pd.DataFrame(matches)
     df = df.sort_values(by=["is_priority", "score"], ascending=[False, False])
@@ -457,6 +461,141 @@ def write_matches_csv(matches):
     write_header = not os.path.exists(OUTPUT_CSV)
     df.to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
     print(f"Wrote {len(matches)} new matches to {OUTPUT_CSV}")
+
+def launch_dashboard(launch=True):
+    # format data
+    df = pd.read_csv('matched_jobs.csv')
+    df = df[["title", "company", "location", "posted_date", "score", "url"]].copy()
+    df["posted_date"] = pd.to_datetime(df["posted_date"]).dt.strftime("%b %d")
+    df.rename(columns={
+        "title": "Title", "company": "Company", "location": "Location",
+        "posted_date": "Date", "score": "Score", "url": "URL"
+    }, inplace=True)
+
+    if not launch:
+        return
+
+    app = Dash()
+
+    app.layout = html.Div([
+        dcc.Tabs([
+
+            # NEW JOBS TAB
+            dcc.Tab(label="New Jobs", children=[
+
+                # toolbar
+                html.Div([
+                    html.Button("SCAN NEW JOBS", id="refresh-btn", n_clicks=0),
+
+                    # action buttons for the currently-selected grid rows
+                    html.Button("Open", id="open-btn", n_clicks=0,
+                                style={"marginLeft": "auto"}),
+                    html.Button("Apply", id="apply-btn", n_clicks=0),
+
+                ], style={
+                    "display": "flex",
+                    "gap": "10px",
+                    "marginBottom": "15px",
+                    "alignItems": "center",
+                }),
+
+                html.Div(id="action-status", style={"marginBottom": "10px", "color": "#555"}),
+
+                dag.AgGrid(
+                    id="job-grid",
+                    rowData=df.to_dict("records"),
+                    columnDefs=[{"field": c} for c in df.columns],
+                    defaultColDef={
+                        "sortable": True,
+                        "filter": True,
+                        "resizable": True,
+                    },
+                    dashGridOptions={
+                        "rowSelection": "multiple",
+                        "suppressRowClickSelection": False,
+                        "rowMultiSelectWithClick": False,
+                    },
+                    style={"height": "700px", "width": "100%"},
+                ),
+
+                # dummy store just to give the clientside "Open" callback somewhere to write
+                dcc.Store(id="open-dummy"),
+            ]),
+
+            # APPLIED
+            dcc.Tab(label="Applied", children=[
+                html.H3("Applied Jobs"),
+                dag.AgGrid(
+                    id="applied-grid",
+                    rowData=_load_applied(),
+                    columnDefs=[{"field": c} for c in df.columns],
+                    defaultColDef={"sortable": True, "filter": True, "resizable": True},
+                    style={"height": "700px", "width": "100%"},
+                ),
+            ]),
+
+        ])
+    ])
+
+    # open button - opens each selected row's URL in a new tab
+    clientside_callback(
+        """
+        function(n_clicks, selectedRows) {
+            if (!n_clicks || !selectedRows || selectedRows.length === 0) {
+                return window.dash_clientside.no_update;
+            }
+            selectedRows.forEach(function(row) {
+                if (row.URL) {
+                    window.open(row.URL, '_blank');
+                }
+            });
+            return window.dash_clientside.no_update;
+        }
+        """,
+        Output("open-dummy", "data"),
+        Input("open-btn", "n_clicks"),
+        State("job-grid", "selectedRows"),
+        prevent_initial_call=True,
+    )
+
+    # apply button - append selected rows to applied_jobs.csv
+    @app.callback(
+        Output("action-status", "children"),
+        Output("applied-grid", "rowData"),
+        Input("apply-btn", "n_clicks"),
+        State("job-grid", "selectedRows"),
+        prevent_initial_call=True,
+    )
+    def apply_to_selected(n_clicks, selected_rows):
+        if not selected_rows:
+            return "No rows selected.", no_update
+
+        ensure_applied_csv()
+
+        new_df = pd.DataFrame(selected_rows)
+        existing = pd.read_csv(APPLIED_CSV)
+
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined.drop_duplicates(subset="URL", keep="first", inplace=True)
+        combined.to_csv(APPLIED_CSV, index=False)
+
+        return (
+            f"Saved {len(new_df)} job(s) to {APPLIED_CSV}.",
+            combined.to_dict("records"),
+        )
+
+    app.run(debug=True)
+
+def ensure_applied_csv():
+    """Create applied_jobs.csv with the correct headers if it doesn't exist yet."""
+    if not os.path.exists(APPLIED_CSV):
+        headers = ["Title", "Company", "Location", "Date", "Score", "URL"]
+        pd.DataFrame(columns=headers).to_csv(APPLIED_CSV, index=False)
+        print(f"Created {APPLIED_CSV}")
+
+def _load_applied():
+    ensure_applied_csv()
+    return pd.read_csv(APPLIED_CSV).to_dict("records")
 
 def main():
     print("Searching for matching job postings")
@@ -487,4 +626,9 @@ def main():
     )
 
 if __name__ == "__main__":
-    main()
+    #main()
+    launch_dashboard()
+    df = pd.DataFrame('applied_jobs.csv')
+    print(df)
+
+    # TODO ADD THIS INTO MAIN, ADJUST WAY TO LAUNCH PROGRAM

@@ -3,3 +3,5 @@ scikit-learn
 python-dotenv
 pandas
 bs4
+dash
+dash_ag_grid
