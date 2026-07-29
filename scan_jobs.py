@@ -45,6 +45,7 @@ EXCLUDE_KEYWORDS = [k.strip().lower() for k in os.getenv("EXCLUDE_KEYWORDS", "")
 OUTPUT_CSV = os.getenv("OUTPUT_CSV", "matched_jobs.csv")
 DB_FILE = os.getenv("DB_FILE", "jobs.db")
 APPLIED_CSV = os.getenv("APPLIED_CSV", "applied_jobs.csv")
+IGNORED_CSV = os.getenv("IGNORED_CSV", "ignored_jobs.csv")
 
 def parse_weight_dict(value):
     """ convert comma-separated environment variable string into a dictionary. example: "python:5,sql:3" becomes: {"python": 5, "sql": 3}
@@ -491,6 +492,7 @@ def launch_dashboard(launch=True):
                     html.Button("Open", id="open-btn", n_clicks=0,
                                 style={"marginLeft": "auto"}),
                     html.Button("Apply", id="apply-btn", n_clicks=0),
+                    html.Button("Ignore", id="ignore-btn", n_clicks=0),
 
                 ], style={
                     "display": "flex",
@@ -560,15 +562,17 @@ def launch_dashboard(launch=True):
 
     # apply button - append selected rows to applied_jobs.csv
     @app.callback(
-        Output("action-status", "children"),
-        Output("applied-grid", "rowData"),
+        Output("action-status", "children", allow_duplicate=True),
+        Output("applied-grid", "rowData", allow_duplicate=True),
+        Output("job-grid", "rowData", allow_duplicate=True),
         Input("apply-btn", "n_clicks"),
         State("job-grid", "selectedRows"),
+        State("job-grid", "rowData"),
         prevent_initial_call=True,
     )
-    def apply_to_selected(n_clicks, selected_rows):
+    def apply_selected(n_clicks, selected_rows,current_rows):
         if not selected_rows:
-            return "No rows selected.", no_update
+            return "No rows selected.", no_update, no_update
 
         ensure_applied_csv()
 
@@ -579,19 +583,64 @@ def launch_dashboard(launch=True):
         combined.drop_duplicates(subset="URL", keep="first", inplace=True)
         combined.to_csv(APPLIED_CSV, index=False)
 
+        # remove applied rows from New Jobs grid
+        applied_urls = {row["URL"] for row in selected_rows}
+        remaining_rows = [row for row in current_rows if row["URL"] not in applied_urls]
+
         return (
             f"Saved {len(new_df)} job(s) to {APPLIED_CSV}.",
             combined.to_dict("records"),
+            remaining_rows,
+        )
+
+    # ignore button - append selected rows to applied_jobs.csv
+    @app.callback(
+        Output("action-status", "children", allow_duplicate=True),
+        Output("applied-grid", "rowData", allow_duplicate=True),
+        Output("job-grid", "rowData", allow_duplicate=True),
+        Input("ignore-btn", "n_clicks"),
+        State("job-grid", "selectedRows"),
+        State("job-grid", "rowData"),
+        prevent_initial_call=True,
+    )
+    def ignore_selected(n_clicks, selected_rows,current_rows):
+        if not selected_rows:
+            return "No rows selected.", no_update, no_update
+
+        ensure_ignored_csv()
+
+        new_df = pd.DataFrame(selected_rows)
+        existing = pd.read_csv(IGNORED_CSV)
+
+        combined = pd.concat([existing, new_df], ignore_index=True)
+        combined.drop_duplicates(subset="URL", keep="first", inplace=True)
+        combined.to_csv(IGNORED_CSV, index=False)
+
+        # remove applied rows from New Jobs grid
+        applied_urls = {row["URL"] for row in selected_rows}
+        remaining_rows = [row for row in current_rows if row["URL"] not in applied_urls]
+
+        return (
+            f"Saved {len(new_df)} job(s) to {IGNORED_CSV}.",
+            combined.to_dict("records"),
+            remaining_rows,
         )
 
     app.run(debug=True)
 
 def ensure_applied_csv():
-    """Create applied_jobs.csv with the correct headers if it doesn't exist yet."""
+    """ create applied_jobs.csv with the correct headers if it doesn't exist yet."""
     if not os.path.exists(APPLIED_CSV):
         headers = ["Title", "Company", "Location", "Date", "Score", "URL"]
         pd.DataFrame(columns=headers).to_csv(APPLIED_CSV, index=False)
         print(f"Created {APPLIED_CSV}")
+
+def ensure_ignored_csv():
+    """ create ignored_jobs.csv with the correct headers if it doesn't exist yet."""
+    if not os.path.exists(IGNORED_CSV):
+        headers = ["Title", "Company", "Location", "Date", "Score", "URL"]
+        pd.DataFrame(columns=headers).to_csv(IGNORED_CSV, index=False)
+        print(f"Created {IGNORED_CSV}")
 
 def _load_applied():
     ensure_applied_csv()
