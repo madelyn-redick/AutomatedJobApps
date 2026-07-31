@@ -15,7 +15,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 from bs4 import BeautifulSoup
 import html
-from dash import Dash, html, dcc, Input, Output, State, no_update, clientside_callback
+from dash import Dash, html as dash_html, dcc, Input, Output, State, no_update, clientside_callback
 import dash_ag_grid as dag
 
 load_dotenv()
@@ -380,6 +380,7 @@ def save_new_jobs(conn, jobs):
 
         # create unique ID for job posting
         h = job_hash(j["title"], j["company"], j["posted_date"])
+        j["job_hash"] = h
 
         # skip jobs already stored
         cur.execute(
@@ -447,10 +448,14 @@ def save_new_jobs(conn, jobs):
     return new_matches
 
 def write_matches_csv(matches):
+    headers = ["job_hash", "title", "company", "location", "score", "description", "semantic_score", "keyword_score","penalty_score", "is_priority", "source", "url", "posted_date"]
+
     if not matches:
         print("No new matches above threshold")
+        pd.DataFrame(columns=headers).to_csv(OUTPUT_CSV, mode="w", header=True, index=False)
         return
-    headers = ["title", "company", "location", "score", "semantic_score", "keyword_score","penalty_score", "is_priority", "source", "url", "posted_date", "description"]
+
+
     """with open('matched_jobs.csv', 'w', newline='', encoding='utf-8') as file:
         writer = csv.writer(file)
         writer.writerow(headers)"""
@@ -459,40 +464,144 @@ def write_matches_csv(matches):
     df = df.sort_values(by=["is_priority", "score"], ascending=[False, False])
     df = df[headers]
 
-    write_header = not os.path.exists(OUTPUT_CSV)
-    df.to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
+    #write_header = not os.path.exists(OUTPUT_CSV)
+    #df.to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
+    df.to_csv(OUTPUT_CSV, mode="w", header=True, index=False)
     print(f"Wrote {len(matches)} new matches to {OUTPUT_CSV}")
 
-def launch_dashboard(launch=True):
-    # format data
-    df = pd.read_csv('matched_jobs.csv')
-    df = df[["title", "company", "location", "posted_date", "score", "url"]].copy()
-    df["posted_date"] = pd.to_datetime(df["posted_date"]).dt.strftime("%b %d")
+def _prepare_applied_view(df):
+    """ derive 'Days Since Applied' from 'Date' and sort ascending (fewest
+    days since applied - i.e. most recently applied - first), for display
+    on the Applied tab.
+    """
+    df = df.copy()
+
+    if df.empty:
+        if "Days Since Applied" not in df.columns:
+            df["Days Since Applied"] = pd.Series(dtype="int")
+        return df
+
+    df = _days_since_applied(df)
+    df = df.sort_values(by="Days Since Applied", ascending=True).reset_index(drop=True)
+    return df
+
+def append_applied_jobs_to_sheet(rows):
+    """ append one row per newly-applied job to a Google Sheet:
+    Title -> column A, Company -> column B, Date Applied -> column C,
+    URL -> column M. Columns D-L are left blank for anything else that
+    might populate them separately.
+
+    Requires GOOGLE_SHEETS_ID to be set, and GOOGLE_SHEETS_CREDENTIALS_FILE
+    to point at a service account JSON key that has been shared as an
+    Editor on the target spreadsheet.
+
+    Args:
+        rows (list[dict]): applied-job rows with Title, Company, Date, URL keys
+
+    Returns:
+        bool: True if the write succeeded, False otherwise (errors are
+        logged, not raised, so a Sheets failure never blocks the CSV save)
+    """
+    if not rows:
+        return True
+
+    if not GOOGLE_SHEETS_ID:
+        print("[warning] GOOGLE_SHEETS_ID not set - skipping Google Sheets export")
+        return False
+
+    try:
+        scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+        creds = Credentials.from_service_account_file(GOOGLE_SHEETS_CREDENTIALS_FILE, scopes=scopes)
+        client = gspread.authorize(creds)
+        worksheet = client.open_by_key(GOOGLE_SHEETS_ID).worksheet(GOOGLE_SHEETS_WORKSHEET)
+
+        for row in rows:
+            # columns A, B, C, D-L (blank), M -> 13 values total
+            sheet_row = [
+                row.get("Title", ""),
+                row.get("Company", ""),
+                row.get("Date", ""),
+                "", "", "", "", "", "", "", "", "",  # D - L left blank
+                row.get("URL", ""),
+            ]
+            worksheet.append_row(sheet_row, value_input_option="USER_ENTERED")
+
+        return True
+
+    except Exception as e:
+        print(f"[error] Failed to write to Google Sheet: {e}")
+        return False
+
+def load_dashboard_df():
+    """ Build the dataframe backing the 'New Jobs' grid. Ensures jobs.db,
+    applied_jobs.csv, and ignored_jobs.csv all exist first so this works
+    no matter which button was pressed first. Falls back to the DB if
+    matched_jobs.csv is empty/missing, and filters out anything already
+    applied to or ignored.
+    """
+    ensure_applied_csv()
+    ensure_ignored_csv()
+
+    if os.path.exists(OUTPUT_CSV):
+        try:
+            df = pd.read_csv(OUTPUT_CSV)
+            use_db = df.empty
+        except pd.errors.EmptyDataError:
+            use_db = True
+    else:
+        use_db = True
+
+    if use_db:
+        conn = init_db()  # CREATE TABLE IF NOT EXISTS so this can't 404 on a fresh run
+        df = pd.read_sql_query(
+            """
+            SELECT job_hash, title, company, location, posted_date, score, description, url
+            FROM jobs ORDER BY score DESC LIMIT 40
+            """,
+            conn,
+        )
+        conn.close()
+
+    df = df[["job_hash","title","company","location","posted_date","score","description","url"]].copy()
+    df["posted_date"] = pd.to_datetime(df["posted_date"], errors="coerce").dt.strftime("%b %d")
     df.rename(columns={
-        "title": "Title", "company": "Company", "location": "Location",
-        "posted_date": "Date", "score": "Score", "url": "URL"
+        "job_hash": "id", "title": "Title", "company": "Company", "location": "Location",
+        "posted_date": "Date", "score": "Score", "description": "Description", "url": "URL",
     }, inplace=True)
+
+    df_applied = pd.read_csv(APPLIED_CSV)
+    df_ignored = pd.read_csv(IGNORED_CSV)
+
+    df = df[~df["id"].isin(df_applied["id"])].copy()
+    if "id" in df_ignored.columns:
+        df = df[~df["id"].isin(df_ignored["id"])].copy()
+
+    return df
+
+def launch_dashboard(launch=True):
+    df = load_dashboard_df()
+    APPLIED_DISPLAY_COLUMNS = ["id", "Title", "Company", "Location", "Date", "Score", "Description", "URL", "Days Since Applied"]
 
     if not launch:
         return
 
     app = Dash()
 
-    app.layout = html.Div([
+    app.layout = dash_html.Div([
         dcc.Tabs([
 
             # NEW JOBS TAB
             dcc.Tab(label="New Jobs", children=[
 
                 # toolbar
-                html.Div([
-                    html.Button("SCAN NEW JOBS", id="refresh-btn", n_clicks=0),
+                dash_html.Div([
+                    dash_html.Button("SCAN NEW JOBS", id="refresh-btn", n_clicks=0),
 
                     # action buttons for the currently-selected grid rows
-                    html.Button("Open", id="open-btn", n_clicks=0,
+                    dash_html.Button("Open", id="open-btn", n_clicks=0,
                                 style={"marginLeft": "auto"}),
-                    html.Button("Apply", id="apply-btn", n_clicks=0),
-                    html.Button("Ignore", id="ignore-btn", n_clicks=0),
+                    dash_html.Button("Apply", id="apply-btn", n_clicks=0),
+                    dash_html.Button("Ignore", id="ignore-btn", n_clicks=0),
 
                 ], style={
                     "display": "flex",
@@ -501,12 +610,12 @@ def launch_dashboard(launch=True):
                     "alignItems": "center",
                 }),
 
-                html.Div(id="action-status", style={"marginBottom": "10px", "color": "#555"}),
+                dash_html.Div(id="action-status", style={"marginBottom": "10px", "color": "#555"}),
 
                 dag.AgGrid(
                     id="job-grid",
                     rowData=df.to_dict("records"),
-                    columnDefs=[{"field": c} for c in df.columns],
+                    columnDefs=[{"field": c, "hide": True} if c == "id" or c == "Description" else {"field": c} for c in df.columns],
                     defaultColDef={
                         "sortable": True,
                         "filter": True,
@@ -524,13 +633,18 @@ def launch_dashboard(launch=True):
                 dcc.Store(id="open-dummy"),
             ]),
 
-            # APPLIED
+            # APPLIED TAB
             dcc.Tab(label="Applied", children=[
-                html.H3("Applied Jobs"),
+                dash_html.H3("Applied Jobs"),
                 dag.AgGrid(
                     id="applied-grid",
                     rowData=_load_applied(),
-                    columnDefs=[{"field": c} for c in df.columns],
+                    columnDefs=[
+                        {"field": c, "hide": True} if c in ("id", "Description")
+                        else {"field": c, "sort": "asc"} if c == "Days Since Applied"
+                        else {"field": c}
+                        for c in APPLIED_DISPLAY_COLUMNS
+                    ],
                     defaultColDef={"sortable": True, "filter": True, "resizable": True},
                     style={"height": "700px", "width": "100%"},
                 ),
@@ -538,6 +652,21 @@ def launch_dashboard(launch=True):
 
         ])
     ])
+
+    # scan new jobs button
+    @app.callback(
+        Output("action-status", "children", allow_duplicate=True),
+        Output("job-grid", "rowData", allow_duplicate=True),
+        Input("refresh-btn", "n_clicks"),
+        prevent_initial_call=True,
+    )
+    def scan_new_jobs(n_clicks):
+        new_matches = get_new_jobs()
+        df = load_dashboard_df()
+        return (
+            f"Scan complete: {len(new_matches)} new match(es) found.",
+            df.to_dict("records"),
+        )
 
     # open button - opens each selected row's URL in a new tab
     clientside_callback(
@@ -554,7 +683,7 @@ def launch_dashboard(launch=True):
             return window.dash_clientside.no_update;
         }
         """,
-        Output("open-dummy", "data"),
+        Output("open-dummy", "data", allow_duplicate=True),
         Input("open-btn", "n_clicks"),
         State("job-grid", "selectedRows"),
         prevent_initial_call=True,
@@ -579,9 +708,19 @@ def launch_dashboard(launch=True):
         new_df = pd.DataFrame(selected_rows)
         existing = pd.read_csv(APPLIED_CSV)
 
+        # only rows not already recorded as applied get logged to google sheet
+        already_applied_ids = set(existing["id"]) if "id" in existing.columns else set()
+        rows_for_sheet = new_df[~new_df["id"].isin(already_applied_ids)].to_dict("records")
+
         combined = pd.concat([existing, new_df], ignore_index=True)
-        combined.drop_duplicates(subset="URL", keep="first", inplace=True)
+        combined.drop_duplicates(subset="id", keep="first", inplace=True)
+        combined = _sort_by_date_desc(combined)
         combined.to_csv(APPLIED_CSV, index=False)
+
+        #sheet_ok = append_applied_jobs_to_sheet(rows_for_sheet)
+        applied_view = _prepare_applied_view(combined)
+        print("APPLIED VIEW:")
+        print(applied_view)
 
         # remove applied rows from New Jobs grid
         applied_urls = {row["URL"] for row in selected_rows}
@@ -589,7 +728,7 @@ def launch_dashboard(launch=True):
 
         return (
             f"Saved {len(new_df)} job(s) to {APPLIED_CSV}.",
-            combined.to_dict("records"),
+            applied_view.to_dict("records"),
             remaining_rows,
         )
 
@@ -631,22 +770,58 @@ def launch_dashboard(launch=True):
 def ensure_applied_csv():
     """ create applied_jobs.csv with the correct headers if it doesn't exist yet."""
     if not os.path.exists(APPLIED_CSV):
-        headers = ["Title", "Company", "Location", "Date", "Score", "URL"]
+        headers = ["id","Title", "Company", "Location", "Date", "Score", "Description", "URL", "Days Since Applied"]
         pd.DataFrame(columns=headers).to_csv(APPLIED_CSV, index=False)
         print(f"Created {APPLIED_CSV}")
 
 def ensure_ignored_csv():
     """ create ignored_jobs.csv with the correct headers if it doesn't exist yet."""
     if not os.path.exists(IGNORED_CSV):
-        headers = ["Title", "Company", "Location", "Date", "Score", "URL"]
+        headers = ["id", "Title", "Company", "Location", "Date", "Score", "Description", "URL"]
         pd.DataFrame(columns=headers).to_csv(IGNORED_CSV, index=False)
         print(f"Created {IGNORED_CSV}")
 
+def _sort_by_date_desc(df, col="Date"):
+    """ sort a dataframe so the newest 'Date' (e.g. 'Jul 29') is on top.
+
+    Note: Date has no year (format is '%b %d'), so all rows parse onto the
+    same reference year. This sorts correctly within a year but can't tell
+    two different years apart - fine for this app since jobs don't stick
+    around that long, but worth knowing if old rows ever pile up.
+    """
+    # TODO
+    if df.empty or col not in df.columns:
+        return df
+    sort_key = pd.to_datetime(df[col], format="%b %d", errors="coerce")
+
+    return (
+        df.assign(_sort_date=sort_key)
+        .sort_values(by="_sort_date", ascending=False)
+        .drop(columns="_sort_date")
+        .reset_index(drop=True)
+    )
+
+def _days_since_applied(df):
+    current_year = datetime.now().year
+
+    df["Days Since Applied"] = (
+        datetime.now()
+        - pd.to_datetime(
+            df["Date"] + f" {current_year}",
+            format="%b %d %Y"
+        )
+    ).dt.days
+    return df
+
 def _load_applied():
     ensure_applied_csv()
+    df = pd.read_csv(APPLIED_CSV)
+    #df = _days_since_applied(df)
+    df = _prepare_applied_view(df)
+    df = _sort_by_date_desc(df)
     return pd.read_csv(APPLIED_CSV).to_dict("records")
 
-def main():
+def get_new_jobs():
     print("Searching for matching job postings")
     all_jobs = []
     #all_jobs += get_adzuna_jobs()
@@ -674,10 +849,13 @@ def main():
         f"{priority_count} flagged as priority."
     )
 
-if __name__ == "__main__":
-    #main()
+    return new_matches
+
+def main():
+
     launch_dashboard()
-    df = pd.DataFrame('applied_jobs.csv')
-    print(df)
+
+if __name__ == "__main__":
+    main()
 
     # TODO ADD THIS INTO MAIN, ADJUST WAY TO LAUNCH PROGRAM
