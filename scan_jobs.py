@@ -520,7 +520,7 @@ def append_applied_jobs_to_sheet(rows):
             sheet_row = [
                 row.get("Title", ""),
                 row.get("Company", ""),
-                row.get("Date", ""),
+                row.get("Date Applied", ""),
                 "", "", "", "", "", "", "", "", "",  # D - L left blank
                 row.get("URL", ""),
             ]
@@ -580,7 +580,7 @@ def load_dashboard_df():
 
 def launch_dashboard(launch=True):
     df = load_dashboard_df()
-    APPLIED_DISPLAY_COLUMNS = ["id", "Title", "Company", "Location", "Date", "Score", "Description", "URL", "Days Since Applied"]
+    APPLIED_DISPLAY_COLUMNS = ["id", "Title", "Company", "Location", "Date", "Score", "Description", "URL", "Date Applied", "Days Since Applied"]
 
     if not launch:
         return
@@ -706,6 +706,7 @@ def launch_dashboard(launch=True):
         ensure_applied_csv()
 
         new_df = pd.DataFrame(selected_rows)
+        new_df["Date Applied"] = datetime.now().strftime("%b %d")
         existing = pd.read_csv(APPLIED_CSV)
 
         # only rows not already recorded as applied get logged to google sheet
@@ -714,13 +715,13 @@ def launch_dashboard(launch=True):
 
         combined = pd.concat([existing, new_df], ignore_index=True)
         combined.drop_duplicates(subset="id", keep="first", inplace=True)
+        combined = _days_since_applied(combined)  # recompute for all applied rows
         combined = _sort_by_date_desc(combined)
         combined.to_csv(APPLIED_CSV, index=False)
 
-        #sheet_ok = append_applied_jobs_to_sheet(rows_for_sheet)
-        applied_view = _prepare_applied_view(combined)
-        print("APPLIED VIEW:")
-        print(applied_view)
+        #sheet_ok = append_applied_jobs_to_sheet(rows_for_sheet) #TODO
+        #applied_view = _prepare_applied_view(combined)
+        applied_view = combined
 
         # remove applied rows from New Jobs grid
         applied_urls = {row["URL"] for row in selected_rows}
@@ -770,7 +771,7 @@ def launch_dashboard(launch=True):
 def ensure_applied_csv():
     """ create applied_jobs.csv with the correct headers if it doesn't exist yet."""
     if not os.path.exists(APPLIED_CSV):
-        headers = ["id","Title", "Company", "Location", "Date", "Score", "Description", "URL", "Days Since Applied"]
+        headers = ["id","Title", "Company", "Location", "Date", "Score", "Description", "URL", "Date Applied", "Days Since Applied"]
         pd.DataFrame(columns=headers).to_csv(APPLIED_CSV, index=False)
         print(f"Created {APPLIED_CSV}")
 
@@ -807,7 +808,7 @@ def _days_since_applied(df):
     df["Days Since Applied"] = (
         datetime.now()
         - pd.to_datetime(
-            df["Date"] + f" {current_year}",
+            df["Date Applied"] + f" {current_year}",
             format="%b %d %Y"
         )
     ).dt.days
