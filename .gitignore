@@ -6,3 +6,4 @@ jobs.db
 .env
 applied_jobs.csv
 ignored_jobs.csv
+google_sheets_API.json

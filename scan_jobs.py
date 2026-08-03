@@ -17,6 +17,8 @@ from bs4 import BeautifulSoup
 import html
 from dash import Dash, html as dash_html, dcc, Input, Output, State, no_update, clientside_callback
 import dash_ag_grid as dag
+import gspread
+from google.oauth2.service_account import Credentials
 
 load_dotenv()
 
@@ -46,6 +48,10 @@ OUTPUT_CSV = os.getenv("OUTPUT_CSV", "matched_jobs.csv")
 DB_FILE = os.getenv("DB_FILE", "jobs.db")
 APPLIED_CSV = os.getenv("APPLIED_CSV", "applied_jobs.csv")
 IGNORED_CSV = os.getenv("IGNORED_CSV", "ignored_jobs.csv")
+
+GOOGLE_SHEETS_ID = os.getenv("GOOGLE_SHEETS_ID", "")
+GOOGLE_SHEETS_CREDENTIALS_FILE = os.getenv("GOOGLE_SHEETS_CREDENTIALS_FILE", "")
+GOOGLE_SHEETS_WORKSHEET = os.getenv("GOOGLE_SHEETS_WORKSHEET", "")
 
 def parse_weight_dict(value):
     """ convert comma-separated environment variable string into a dictionary. example: "python:5,sql:3" becomes: {"python": 5, "sql": 3}
@@ -101,6 +107,11 @@ def clean_html_text(text):
     return text
 
 def init_db():
+    """ initialize or connect to SQLite database, ensure 'jobs' table exists, creating it if first run
+
+    Returns:
+        sqlite3.Connection: open connection to the jobs database
+    """
     conn = sqlite3.connect(DB_FILE)
     conn.execute(
         """
@@ -128,6 +139,16 @@ def init_db():
     return conn
 
 def job_hash(title, company, posted_date):
+    """ build unique identifier for a job posting so same listing isn't stored or surfaced twice
+
+    Args:
+        title (str): job title
+        company (str): company/employer name
+        posted_date (str): date job was posted (e.g. 'YYYY-MM-DD')
+
+    Returns:
+        str: SHA-256 hex digest uniquely identifying this posting
+    """
     # normalize job title, company, and posted date
     raw = f"{title.strip().lower()}|{company.strip().lower()}|{posted_date}"
 
@@ -254,6 +275,12 @@ def load_resume_text():
 
 def filter_excluded_jobs(jobs):
     """ remove jobs containing words should never be considered
+
+    Args:
+        jobs (list[dict]): job postings to filter, each with 'title' and 'description'
+
+    Returns:
+        filtered_jobs (list[dict]): jobs that do not contain any EXCLUDE_KEYWORDS
     """
 
     filtered_jobs = []
@@ -302,12 +329,6 @@ def score_jobs(jobs, resume_text):
     # build text corpus containing resume and all job descriptions
     descriptions = [(j["title"] + " " + j["description"]) for j in jobs]
     corpus = [resume_text] + descriptions
-
-    # convert text into TF-IDF vectors
-    vectorizer = TfidfVectorizer(
-        stop_words="english",
-        max_features=5000
-    )
 
     # convert corpus into TF-IDF vectors, remove stop words
     vectorizer = TfidfVectorizer(stop_words="english", max_features=5000)
@@ -448,6 +469,13 @@ def save_new_jobs(conn, jobs):
     return new_matches
 
 def write_matches_csv(matches):
+    """ write newly-scored job matches out to OUTPUT_CSV, sorted with priority jobs first then by score descending. overwrites any existing file each time it's called (not appended)
+
+    Args:
+        matches (list[dict]): jobs that passed score threshold or were
+            flagged as priority; if empty, an empty CSV with headers only
+            is written
+    """
     headers = ["job_hash", "title", "company", "location", "score", "description", "semantic_score", "keyword_score","penalty_score", "is_priority", "source", "url", "posted_date"]
 
     if not matches:
@@ -455,17 +483,10 @@ def write_matches_csv(matches):
         pd.DataFrame(columns=headers).to_csv(OUTPUT_CSV, mode="w", header=True, index=False)
         return
 
-
-    """with open('matched_jobs.csv', 'w', newline='', encoding='utf-8') as file:
-        writer = csv.writer(file)
-        writer.writerow(headers)"""
-
     df = pd.DataFrame(matches)
     df = df.sort_values(by=["is_priority", "score"], ascending=[False, False])
     df = df[headers]
 
-    #write_header = not os.path.exists(OUTPUT_CSV)
-    #df.to_csv(OUTPUT_CSV, mode="a", header=write_header, index=False)
     df.to_csv(OUTPUT_CSV, mode="w", header=True, index=False)
     print(f"Wrote {len(matches)} new matches to {OUTPUT_CSV}")
 
@@ -473,6 +494,13 @@ def _prepare_applied_view(df):
     """ derive 'Days Since Applied' from 'Date' and sort ascending (fewest
     days since applied - i.e. most recently applied - first), for display
     on the Applied tab.
+
+    Args:
+        df (pd.DataFrame): applied-jobs dataframe with a 'Date Applied' column
+
+    Returns:
+        pd.DataFrame: copy of df with a 'Days Since Applied' column added,
+            sorted so the most recently applied jobs come first
     """
     df = df.copy()
 
@@ -487,13 +515,12 @@ def _prepare_applied_view(df):
 
 def append_applied_jobs_to_sheet(rows):
     """ append one row per newly-applied job to a Google Sheet:
-    Title -> column A, Company -> column B, Date Applied -> column C,
-    URL -> column M. Columns D-L are left blank for anything else that
-    might populate them separately.
+    Title: column A, Company: column B, Date Applied: column C,
+    URL: column M (columns D-L left blank)
 
-    Requires GOOGLE_SHEETS_ID to be set, and GOOGLE_SHEETS_CREDENTIALS_FILE
+    requires GOOGLE_SHEETS_ID to be set, and GOOGLE_SHEETS_CREDENTIALS_FILE
     to point at a service account JSON key that has been shared as an
-    Editor on the target spreadsheet.
+    Editor on the target spreadsheet
 
     Args:
         rows (list[dict]): applied-job rows with Title, Company, Date, URL keys
@@ -516,7 +543,6 @@ def append_applied_jobs_to_sheet(rows):
         worksheet = client.open_by_key(GOOGLE_SHEETS_ID).worksheet(GOOGLE_SHEETS_WORKSHEET)
 
         for row in rows:
-            # columns A, B, C, D-L (blank), M -> 13 values total
             sheet_row = [
                 row.get("Title", ""),
                 row.get("Company", ""),
@@ -533,11 +559,7 @@ def append_applied_jobs_to_sheet(rows):
         return False
 
 def load_dashboard_df():
-    """ Build the dataframe backing the 'New Jobs' grid. Ensures jobs.db,
-    applied_jobs.csv, and ignored_jobs.csv all exist first so this works
-    no matter which button was pressed first. Falls back to the DB if
-    matched_jobs.csv is empty/missing, and filters out anything already
-    applied to or ignored.
+    """ build dataframe backing 'New Jobs' grid. ensures jobs.db, applied_jobs.csv, and ignored_jobs.csv exist first. falls back to the DB if matched_jobs.csv is empty/missing, filters out anything already applied to or ignored.
     """
     ensure_applied_csv()
     ensure_ignored_csv()
@@ -578,7 +600,17 @@ def load_dashboard_df():
 
     return df
 
-def launch_dashboard(launch=True):
+def launch_dashboard(launch=True, google_sheets=False):
+    """ build and run Dash job-review dashboard, with a 'New Jobs' tab
+    (scan/open/apply/ignore actions on scored postings) and an 'Applied'
+    tab (history of jobs already applied to).
+
+    Args:
+        launch (bool): if False, skip building and running the app entirely
+        google_sheets (bool): passed through to the apply-button callback
+            to control whether newly-applied jobs are also synced to a
+            Google Sheet in addition to the local CSV
+    """
     df = load_dashboard_df()
     APPLIED_DISPLAY_COLUMNS = ["id", "Title", "Company", "Location", "Date", "Score", "Description", "URL", "Date Applied", "Days Since Applied"]
 
@@ -719,8 +751,10 @@ def launch_dashboard(launch=True):
         combined = _sort_by_date_desc(combined)
         combined.to_csv(APPLIED_CSV, index=False)
 
-        #sheet_ok = append_applied_jobs_to_sheet(rows_for_sheet) #TODO
-        #applied_view = _prepare_applied_view(combined)
+        if google_sheets:
+            sheet_ok = append_applied_jobs_to_sheet(rows_for_sheet)
+            if not sheet_ok:
+                print("[warning] Applied jobs saved to CSV, but Google Sheets sync failed.")
         applied_view = combined
 
         # remove applied rows from New Jobs grid
@@ -783,14 +817,7 @@ def ensure_ignored_csv():
         print(f"Created {IGNORED_CSV}")
 
 def _sort_by_date_desc(df, col="Date"):
-    """ sort a dataframe so the newest 'Date' (e.g. 'Jul 29') is on top.
-
-    Note: Date has no year (format is '%b %d'), so all rows parse onto the
-    same reference year. This sorts correctly within a year but can't tell
-    two different years apart - fine for this app since jobs don't stick
-    around that long, but worth knowing if old rows ever pile up.
-    """
-    # TODO
+    """ sort a dataframe by column in descending order """
     if df.empty or col not in df.columns:
         return df
     sort_key = pd.to_datetime(df[col], format="%b %d", errors="coerce")
@@ -803,6 +830,16 @@ def _sort_by_date_desc(df, col="Date"):
     )
 
 def _days_since_applied(df):
+    """ compute how many days have elapsed since each job's 'Date Applied'
+    value, assuming the current year (since 'Date Applied' is stored
+    without a year, e.g. 'Jan 05').
+
+    Args:
+        df (pd.DataFrame): dataframe containing a 'Date Applied' column
+
+    Returns:
+        pd.DataFrame: same dataframe with a 'Days Since Applied' integer column added
+    """
     current_year = datetime.now().year
 
     df["Days Since Applied"] = (
@@ -815,14 +852,28 @@ def _days_since_applied(df):
     return df
 
 def _load_applied():
+    """ load applied_jobs.csv for display on the Applied tab, creating file first if it doesn't exist yet
+
+    Returns:
+        list[dict]: applied-job records as returned by pandas.DataFrame.to_dict('records')
+    """
     ensure_applied_csv()
     df = pd.read_csv(APPLIED_CSV)
     #df = _days_since_applied(df)
     df = _prepare_applied_view(df)
     df = _sort_by_date_desc(df)
-    return pd.read_csv(APPLIED_CSV).to_dict("records")
+    return df.to_dict("records")
+    #return pd.read_csv(APPLIED_CSV).to_dict("records")
 
 def get_new_jobs():
+    """ run one full scan cycle: fetch postings from all configured
+    sources, filter out excluded jobs, score remainder against resume/cover letter, persist newly-seen postings to the database, and write qualifying matches out to OUTPUT_CSV
+
+    Returns:
+        list[dict]: newly-discovered jobs that met the score threshold or
+            were flagged as priority
+    """
+
     print("Searching for matching job postings")
     all_jobs = []
     #all_jobs += get_adzuna_jobs()
@@ -854,9 +905,7 @@ def get_new_jobs():
 
 def main():
 
-    launch_dashboard()
+    launch_dashboard(google_sheets=True)
 
 if __name__ == "__main__":
     main()
-
-    # TODO ADD THIS INTO MAIN, ADJUST WAY TO LAUNCH PROGRAM
